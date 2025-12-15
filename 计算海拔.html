@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>批量海拔高度查询器</title>
+    <!-- 引入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 使用 Inter 字体作为默认字体 */
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+        /* 确保 textarea 字体是等宽的，便于对齐表格数据 */
+        textarea {
+            font-family: 'Consolas', 'Courier New', monospace;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+
+    <div id="app" class="w-full max-w-4xl bg-white shadow-xl rounded-xl p-6 md:p-10 space-y-8">
+        <h1 class="text-3xl font-bold text-gray-800 text-center border-b pb-4">批量海拔高度查询</h1>
+        <p class="text-center text-gray-600">粘贴您的数据（支持逗号或制表符分隔）。格式：酒店ID, 纬度, 经度</p>
+
+        <!-- 输入和输出区域容器 -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            
+            <!-- 批量输入区 -->
+            <div class="space-y-3">
+                <label for="batchInput" class="block text-lg font-semibold text-gray-700">1. 输入数据 (ID, Lat, Lon)</label>
+                <textarea id="batchInput" rows="15" placeholder="粘贴您的数据，每行一条记录。例如：&#10;HotelA, 39.9042, 116.4074&#10;HotelB, 34.0522, -118.2437&#10;..."
+                          class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 shadow-inner"></textarea>
+                <p class="text-sm text-gray-500">提示：经度范围 -180 到 180，纬度范围 -90 到 90。</p>
+            </div>
+            
+            <!-- 批量输出区 -->
+            <div class="space-y-3">
+                <label for="batchOutput" class="block text-lg font-semibold text-gray-700">2. 结果输出 (ID, Lat, Lon, Elevation)</label>
+                <textarea id="batchOutput" rows="15" placeholder="查询结果将显示在这里..." readonly
+                          class="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-50 focus:ring-blue-500 focus:border-blue-500 transition duration-150 shadow-inner"></textarea>
+            </div>
+        </div>
+
+        <!-- 查询按钮和状态显示 -->
+        <div class="space-y-4 pt-4">
+            <button id="batchSearchButton" onclick="processBatchElevation()"
+                    class="w-full bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 transition duration-200 shadow-xl hover:shadow-2xl focus:outline-none focus:ring-4 focus:ring-blue-500 focus:ring-opacity-50 disabled:opacity-50 disabled:cursor-not-allowed">
+                批量查询海拔高度
+            </button>
+            <div id="statusMessage" class="p-3 text-center text-gray-700 italic bg-gray-100 rounded-lg transition-all duration-300 border">
+                等待输入数据...
+            </div>
+        </div>
+        
+    </div>
+
+    <script type="text/javascript">
+        // Gemini API Configuration (Leave API key empty)
+        const apiKey = ""; 
+        const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent";
+        
+        // Delay between sequential requests to mitigate rate limits
+        const DELAY_MS = 500; 
+
+        // DOM Elements
+        const batchInput = document.getElementById('batchInput');
+        const batchOutput = document.getElementById('batchOutput');
+        const batchSearchButton = document.getElementById('batchSearchButton');
+        const statusMessage = document.getElementById('statusMessage');
+
+        /**
+         * Utility function for small delay.
+         * @param {number} ms - Milliseconds to wait.
+         */
+        const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+        /**
+         * Makes a fetch request with exponential backoff for retries.
+         * @param {string} url - The API URL.
+         * @param {object} options - Fetch options (method, headers, body).
+         * @param {number} retries - Current retry count.
+         * @returns {Promise<Response>} The fetch response.
+         */
+        async function fetchWithRetry(url, options, retries = 0) {
+            const maxRetries = 5;
+            const currentDelay = Math.pow(2, retries) * 1000; // 1s, 2s, 4s, 8s, 16s...
+
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) {
+                    if (response.status === 429 && retries < maxRetries) { // Too Many Requests
+                        await new Promise(resolve => setTimeout(resolve, currentDelay));
+                        return fetchWithRetry(url, options, retries + 1);
+                    }
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response;
+            } catch (error) {
+                if (retries < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, currentDelay));
+                    return fetchWithRetry(url, options, retries + 1);
+                }
+                throw new Error("API call failed after multiple retries.");
+            }
+        }
+
+        /**
+         * Extracts and cleans the elevation text from the raw response.
+         * @param {string} text - The raw text response from the model.
+         * @returns {string} The cleaned elevation value and unit.
+         */
+        function extractElevationText(text) {
+            if (!text) return "Error: No content";
+            
+            // Regex to find common formats: number with optional commas/dots, followed by a unit
+            const match = text.match(/([\d\.\,]+)\s*(meters|m|米|千米|km|kilometres|ft|英尺)/i);
+
+            if (match) {
+                const value = match[1].replace(/,/g, ''); // Remove commas for clean data
+                const unit = match[2].toLowerCase();
+                return `${value} ${unit}`;
+            }
+
+            // Fallback: Return a clean, truncated version of the raw text
+            return text.split(/[.\n]/)[0].trim().substring(0, 50);
+        }
+
+        /**
+         * Fetches a single elevation from Gemini API.
+         * @param {string} id - The record ID (e.g., Hotel ID).
+         * @param {number} lat - Latitude.
+         * @param {number} lon - Longitude.
+         * @returns {Promise<string>} The elevation string or an error message.
+         */
+        async function fetchSingleElevation(id, lat, lon) {
+            const userQuery = `What is the precise elevation in meters at the geographical coordinates: Latitude ${lat}, Longitude ${lon}? Please provide only the numerical value and the unit (e.g., '1234 meters') based on reliable geographical data.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                tools: [{ "google_search": {} }],
+                systemInstruction: {
+                    parts: [{ text: "You are a precise geographical data assistant. Your task is to find the elevation for the given latitude and longitude using real-time search and state only the final numerical result and unit (e.g., '1234 meters' or '45 feet'). Do not include any other text." }]
+                },
+            };
+
+            try {
+                const url = `${apiUrl}?key=${apiKey}`;
+                const options = {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                };
+                
+                const response = await fetchWithRetry(url, options);
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (text) {
+                    return extractElevationText(text);
+                } else {
+                    return "Query failed (No content)";
+                }
+            } catch (error) {
+                console.error(`Error for ${id} (${lat}, ${lon}):`, error);
+                return `API_Error: ${error.message}`;
+            }
+        }
+
+        /**
+         * Main function to process the batch input.
+         */
+        async function processBatchElevation() {
+            const rawInput = batchInput.value.trim();
+            if (!rawInput) {
+                statusMessage.innerHTML = '<span class="text-red-600 font-semibold">错误：请输入数据。</span>';
+                return;
+            }
+
+            // 1. Set Loading State
+            batchSearchButton.disabled = true;
+            batchOutput.value = '';
+            statusMessage.classList.remove('text-red-600', 'bg-green-50');
+            statusMessage.classList.add('bg-yellow-100');
+
+            // 2. Parse Input
+            const lines = rawInput.split('\n').filter(line => line.trim() !== '');
+            const dataToProcess = [];
+            const outputHeaders = "ID, Latitude, Longitude, Elevation (海拔)";
+
+            // Determine delimiter: try comma first, then fallback to tab
+            const firstLine = lines[0] || "";
+            const delimiter = firstLine.includes(',') ? ',' : /\t/;
+
+            for (const [index, line] of lines.entries()) {
+                const parts = line.split(delimiter).map(p => p.trim());
+                if (parts.length >= 3) {
+                    const id = parts[0];
+                    const lat = parseFloat(parts[1]);
+                    const lon = parseFloat(parts[2]);
+                    
+                    if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+                        dataToProcess.push({ id, lat, lon, error: `Invalid Coordinates: ${parts[1]}, ${parts[2]}` });
+                    } else {
+                        dataToProcess.push({ id, lat, lon });
+                    }
+                } else {
+                    dataToProcess.push({ id: `Line ${index + 1}`, lat: null, lon: null, error: "Skipped: Missing data (Need 3 columns)" });
+                }
+            }
+            
+            // 3. Process Data
+            let finalOutput = [outputHeaders];
+            let successfulQueries = 0;
+
+            for (let i = 0; i < dataToProcess.length; i++) {
+                const record = dataToProcess[i];
+                let elevation = '';
+
+                if (record.error) {
+                    elevation = record.error;
+                } else {
+                    // Update status for current query
+                    statusMessage.innerHTML = `<div class="flex items-center justify-center">
+                        <svg class="animate-spin mr-2 h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        查询中: ${i + 1} / ${dataToProcess.length} (ID: ${record.id})
+                    </div>`;
+
+                    elevation = await fetchSingleElevation(record.id, record.lat, record.lon);
+                    
+                    if (!elevation.startsWith('API_Error') && !elevation.includes('failed')) {
+                        successfulQueries++;
+                    }
+
+                    // Add a small delay between requests to be gentle on the API service
+                    await delay(DELAY_MS);
+                }
+
+                // Append result to output
+                finalOutput.push(`${record.id}, ${record.lat || 'N/A'}, ${record.lon || 'N/A'}, ${elevation}`);
+                batchOutput.value = finalOutput.join('\n');
+                batchOutput.scrollTop = batchOutput.scrollHeight; // Auto-scroll
+            }
+
+            // 4. Final Status Update
+            batchSearchButton.disabled = false;
+            statusMessage.classList.remove('bg-yellow-100');
+            statusMessage.classList.add('bg-green-50');
+            statusMessage.innerHTML = `<span class="font-bold text-green-700">批量查询完成！</span> 成功处理 ${successfulQueries} 条记录。总记录数 ${dataToProcess.length}。`;
+        }
+        
+        // Example Data Load on Page Load
+        window.onload = () => {
+             batchInput.value = 
+`Hotel_001, 39.9042, 116.4074
+Hotel_002, 40.7128, -74.0060
+Hotel_003, -33.8688, 151.2093
+Hotel_004, 35.6895, 139.6917
+Hotel_005, 51.5074, 0.1278
+Hotel_006, 48.8566, 2.3522`;
+        }
+    </script>
+
+</body>
+</html>
